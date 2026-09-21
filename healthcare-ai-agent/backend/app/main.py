@@ -25,7 +25,7 @@ origins = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins==[
-        "https://healthcare-ai-voice-agent.vercel.app",
+        "https://healthcare-ai-voice-agent-two.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
