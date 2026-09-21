@@ -27,7 +27,7 @@ app.add_middleware(
     allow_origins=[
         "https://healthcare-ai-voice-agent-two.vercel.app",
     ],
-    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_origin_regex=r"https://[a-zA-Z0-9-]+-portfolio-a1d5beeb\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
