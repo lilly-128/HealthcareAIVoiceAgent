@@ -49,6 +49,25 @@ def _today() -> date:
     return _now().date()
 
 
+def _to_india_naive(value: datetime) -> datetime:
+    """
+    Convert a datetime to India local time and remove
+    timezone information.
+
+    PostgreSQL scheduling data is stored as naive
+    India-local datetimes.
+    """
+
+    if value.tzinfo is not None:
+        value = value.astimezone(APP_TIMEZONE)
+
+    return value.replace(
+        tzinfo=None,
+        second=0,
+        microsecond=0,
+    )
+
+
 # =============================================================
 # NORMALIZATION
 # =============================================================
@@ -172,17 +191,6 @@ def generate_slots(
     Generate slots from the doctor's active calendar.
 
     Existing slots are NEVER overwritten.
-
-    Example for a 30-minute consultation:
-
-        Calendar: 14:00 - 17:00
-
-        14:00
-        14:30
-        15:00
-        15:30
-        16:00
-        16:30
     """
 
     # =========================================================
@@ -330,10 +338,6 @@ def generate_slots(
             if calendar.end_time is None:
                 continue
 
-            # -------------------------------------------------
-            # Calendar start/end
-            # -------------------------------------------------
-
             cursor = datetime.combine(
                 day,
                 calendar.start_time,
@@ -346,10 +350,6 @@ def generate_slots(
 
             if end <= cursor:
                 continue
-
-            # -------------------------------------------------
-            # Generate each consultation slot
-            # -------------------------------------------------
 
             while cursor + step <= end:
 
@@ -630,7 +630,8 @@ def check_availability(
     """
     Return only REAL AVAILABLE slots from the database.
 
-    No availability is invented.
+    All incoming datetimes are normalized to
+    India-local naive datetimes before querying PostgreSQL.
     """
 
     # =========================================================
@@ -692,16 +693,16 @@ def check_availability(
 
     else:
 
-        requested_start = date_from.replace(
-            second=0,
-            microsecond=0,
+        # IMPORTANT:
+        # Normalize timezone-aware input from the AI/API.
+        requested_start = _to_india_naive(
+            date_from
         )
 
         if date_to is not None:
 
-            requested_end = date_to.replace(
-                second=0,
-                microsecond=0,
+            requested_end = _to_india_naive(
+                date_to
             )
 
         else:
