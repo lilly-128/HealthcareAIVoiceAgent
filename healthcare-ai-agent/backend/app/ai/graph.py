@@ -89,7 +89,7 @@ MAX_TOOL_ROUNDS = 4
 
 GROQ_MODEL_CANDIDATES = [
     "openai/gpt-oss-20b",
-    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
     "qwen/qwen3.8-27b",
 ]
 
@@ -302,6 +302,9 @@ def build_tools(
 
     for name, params in TOOL_SCHEMAS.items():
 
+        # Appointment creation must be backend-controlled so the LLM can
+        # never invent a slot_id. Availability returns the real slot and
+        # _deterministic_booking() performs the actual booking.
         if name == "create_appointment":
             continue
 
@@ -823,56 +826,6 @@ def _extract_time(
 
 
 # ================================================================
-# Extract city from normal patient text
-# ================================================================
-
-def _normalize_city(value: str | None) -> Optional[str]:
-    if not value:
-        return None
-    value = " ".join(value.strip().split())
-    aliases = {
-        "vizag": "Visakhapatnam",
-        "visakhapatnam": "Visakhapatnam",
-        "amalapuram": "Amalapuram",
-    }
-    return aliases.get(value.lower(), value.title())
-
-
-def _extract_city(text: str) -> Optional[str]:
-    pattern = r"\b(?:in|from|near)\s+([A-Za-z][A-Za-z .'-]{1,50}?)(?=\s+(?:for|on|at|around|near|with)\b|[,.!?]|$)"
-    for match in re.finditer(pattern, text, re.IGNORECASE):
-        candidate = re.sub(r"\s+", " ", match.group(1).strip(" ,.!?"))
-        if candidate.lower() in {
-            "a doctor", "doctor", "doctors", "a hospital", "hospital",
-            "the doctor", "the hospital", "morning", "afternoon", "evening",
-        }:
-            continue
-        return _normalize_city(candidate)
-
-    # Also support a standalone city message such as:
-    #     Visakhapatnam
-    # This is deliberately conservative so words like "yes", "doctor",
-    # or "appointment" are never treated as cities.
-    standalone = re.sub(r"\s+", " ", text.strip(" ,.!?"))
-    if (
-        standalone
-        and len(standalone.split()) <= 4
-        and not re.search(r"\d", standalone)
-        and not _extract_specialty(standalone)
-        and standalone.lower() not in {
-            "yes", "no", "okay", "ok", "confirm", "confirmed",
-            "book", "booking", "appointment", "appointments",
-            "doctor", "doctors", "hospital", "hospitals",
-            "morning", "afternoon", "evening", "night",
-        }
-        and not re.match(r"^(?:dr\.?|doctor)\s+", standalone, re.IGNORECASE)
-    ):
-        return _normalize_city(standalone)
-
-    return None
-
-
-# ================================================================
 # Detect simple specialty changes
 # ================================================================
 
@@ -920,6 +873,22 @@ def _extract_specialty(
 
             return specialty
 
+    return None
+
+
+# ================================================================
+# Extract city from normal patient text
+# ================================================================
+def _extract_city(text: str) -> Optional[str]:
+    value = text.strip().lower()
+    aliases = {
+        "visakhapatnam": "Visakhapatnam",
+        "vizag": "Visakhapatnam",
+        "amalapuram": "Amalapuram",
+    }
+    for key, city in aliases.items():
+        if re.search(rf"\b{re.escape(key)}\b", value):
+            return city
     return None
 
 
@@ -990,18 +959,13 @@ def _extract_user_context(
     # ------------------------------------------------------------
     # City
     # ------------------------------------------------------------
-
     city_value = _extract_city(text)
     if city_value:
         old_city = updated.get("city")
         updated["city"] = city_value
-        if old_city and old_city.strip().lower() != city_value.strip().lower():
-            updated["hospital_id"] = None
-            updated["hospital_name"] = None
-            updated["doctor_id"] = None
-            updated["doctor_name"] = None
-            updated["selected_slot_id"] = None
-            updated["appointment_id"] = None
+        if old_city and old_city.lower() != city_value.lower():
+            for key in ("hospital_id", "hospital_name", "doctor_id", "doctor_name", "selected_slot_id", "appointment_id"):
+                updated[key] = None
             updated["booking_confirmed"] = False
 
     # ------------------------------------------------------------
@@ -1535,6 +1499,146 @@ def _update_context(
 
 
 # ================================================================
+# Deterministic discovery
+# ================================================================
+def _save_turn(conversation, db, user_text: str, reply: str, context: dict):
+    """Persist one deterministic response and return the standard API shape."""
+    conversation.messages = (conversation.messages or []) + [
+        {"role": "user", "content": user_text},
+        {"role": "assistant", "content": reply},
+    ]
+    conversation.context = context
+    db.add(conversation)
+    db.commit()
+    return {
+        "reply": reply,
+        "capabilities_used": [],
+        "correlation_id": conversation.correlation_id,
+        "context": context,
+    }
+
+
+def _deterministic_discovery(ctx: CapabilityContext, context: dict) -> Optional[dict]:
+    """
+    Deterministically handle specialty + city discovery.
+
+    This is deliberately done outside the LLM.  A patient saying only
+    "Visakhapatnam" after the bot asks for a city must immediately use the
+    stored specialty and query the real scheduling capabilities.
+    """
+    specialty = context.get("specialty")
+    city = context.get("city")
+
+    if not specialty or not city:
+        return None
+
+    # If a valid doctor is already selected, discovery is complete.
+    if context.get("doctor_id"):
+        return None
+
+    search_hospitals = REGISTRY.get("search_hospitals")
+    search_doctors = REGISTRY.get("search_doctors")
+
+    if not search_hospitals or not search_doctors:
+        return None
+
+    hospital_result = search_hospitals(
+        ctx,
+        city=city,
+        specialty=specialty,
+    ) or {}
+
+    hospitals = (
+        hospital_result.get("hospitals")
+        or hospital_result.get("results")
+        or hospital_result.get("data")
+        or []
+    )
+
+    # Never trust an LLM-created hospital. Keep only real records that
+    # explicitly report the requested city.
+    requested_city = str(city).strip().casefold()
+    exact_hospitals = [
+        h for h in hospitals
+        if str(h.get("city") or "").strip().casefold() == requested_city
+    ]
+
+    if not exact_hospitals:
+        return {
+            "status": "NO_HOSPITALS",
+            "result": {"hospitals": []},
+            "context": context,
+        }
+
+    # If there are multiple real hospitals, let the patient choose.
+    if len(exact_hospitals) > 1:
+        return {
+            "status": "HOSPITALS_FOUND",
+            "result": {"hospitals": exact_hospitals},
+            "context": context,
+        }
+
+    hospital = exact_hospitals[0]
+    hospital_id = hospital.get("hospital_id") or hospital.get("id")
+    if not hospital_id:
+        return {
+            "status": "NO_HOSPITALS",
+            "result": {"hospitals": []},
+            "context": context,
+        }
+
+    context["hospital_id"] = hospital_id
+    context["hospital_name"] = (
+        hospital.get("name") or hospital.get("hospital_name")
+    )
+
+    doctor_result = search_doctors(
+        ctx,
+        specialty=specialty,
+        city=city,
+        hospital_id=hospital_id,
+    ) or {}
+
+    doctors = (
+        doctor_result.get("doctors")
+        or doctor_result.get("results")
+        or doctor_result.get("data")
+        or []
+    )
+
+    exact_doctors = [
+        d for d in doctors
+        if str(d.get("city") or "").strip().casefold() == requested_city
+        and str(d.get("hospital_id") or "") == str(hospital_id)
+    ]
+
+    if not exact_doctors:
+        context["hospital_id"] = None
+        context["hospital_name"] = None
+        return {
+            "status": "NO_DOCTORS",
+            "result": {"doctors": []},
+            "context": context,
+        }
+
+    if len(exact_doctors) == 1:
+        doctor = exact_doctors[0]
+        context["doctor_id"] = doctor.get("doctor_id") or doctor.get("id")
+        context["doctor_name"] = doctor.get("doctor_name") or doctor.get("name")
+        return {
+            "status": "DOCTOR_SELECTED",
+            "result": {"doctors": exact_doctors},
+            "context": context,
+        }
+
+    return {
+        "status": "DOCTORS_FOUND",
+        "result": {"doctors": exact_doctors},
+        "context": context,
+    }
+
+
+# ================================================================
 # Deterministic booking helpers
 # ================================================================
 
@@ -2017,6 +2121,59 @@ def run_turn(
     )
 
     # ------------------------------------------------------------
+    # Deterministic discovery path
+    # ------------------------------------------------------------
+    try:
+        discovery = _deterministic_discovery(ctx, context)
+    except Exception as error:
+        log.exception("Deterministic discovery failed: %s", error)
+        discovery = None
+
+    if discovery:
+        context = discovery["context"]
+        conversation.context = context
+        status = discovery["status"]
+        if status == "NO_HOSPITALS":
+            reply = f"I could not find an approved hospital with an active {context['specialty']} doctor in {context['city']}. Please choose another city."
+            conversation.messages = (conversation.messages or []) + [{"role":"user","content":user_text},{"role":"assistant","content":reply}]
+            db.add(conversation); db.commit()
+            return {"reply":reply,"capabilities_used":["search_hospitals"],"correlation_id":conversation.correlation_id,"context":context}
+        if status == "HOSPITALS_FOUND":
+            hospitals=discovery["result"].get("hospitals") or []
+            names=[h.get("name") for h in hospitals if h.get("name")]
+            reply=f"I found these hospitals in {context['city']} for {context['specialty']}: {', '.join(names)}. Which hospital would you like?"
+            conversation.messages=(conversation.messages or []) + [{"role":"user","content":user_text},{"role":"assistant","content":reply}]
+            db.add(conversation); db.commit()
+            return {"reply":reply,"capabilities_used":["search_hospitals"],"correlation_id":conversation.correlation_id,"context":context}
+        if status == "NO_DOCTORS":
+            reply = (
+                f"I found {context.get('hospital_name', 'the hospital')} in "
+                f"{context['city']}, but there are no active {context['specialty']} doctors there."
+            )
+            return _save_turn(conversation, db, user_text, reply, context)
+
+        if status == "DOCTOR_SELECTED":
+            reply = (
+                f"I found {context['doctor_name']} at {context['hospital_name']} "
+                f"in {context['city']}. What date would you like the appointment?"
+            )
+            return _save_turn(conversation, db, user_text, reply, context)
+
+        if status == "DOCTORS_FOUND":
+            doctors = discovery["result"].get("doctors") or []
+            names = [
+                d.get("doctor_name") or d.get("name")
+                for d in doctors
+                if d.get("doctor_name") or d.get("name")
+            ]
+            reply = (
+                f"I found these {context['specialty']} doctors at "
+                f"{context.get('hospital_name', 'the selected hospital')} in "
+                f"{context['city']}: {', '.join(names)}. Which doctor would you like to book?"
+            )
+            return _save_turn(conversation, db, user_text, reply, context)
+
+    # ------------------------------------------------------------
     # Deterministic booking path
     # ------------------------------------------------------------
 
@@ -2272,9 +2429,8 @@ BOOKING FLOW:
 4. Find doctors belonging to that hospital.
 5. As soon as doctor + date + time are known, AUTOMATICALLY call
    check_availability. Never ask the patient to verify availability.
-6. If the exact requested time is available, the backend will create the
-   appointment using the real slot_id returned by the database. Do not invent
-   or request a slot_id.
+6. If the exact requested time is available, AUTOMATICALLY call
+   create_appointment using the returned slot_id.
 7. A complete request such as "Book Dr. Guna at 11 am on 26-09-2026"
    is already a booking instruction. Do NOT ask an additional
    yes/no confirmation before creating the appointment.
@@ -2440,44 +2596,61 @@ Never call a tool simply because a previous tool was called.
         user_text,
     )
 
-    # ------------------------------------------------------------
-    # Backend-controlled booking after tool discovery
-    # ------------------------------------------------------------
-    try:
-        post_booking = _deterministic_booking(ctx, context)
-    except Exception as error:
-        post_booking = None
-        log.exception("Post-graph deterministic booking failed: %s", error)
+    # The LLM may have discovered the doctor/date/time during tool use.
+    # Re-run the controlled booking path after context extraction so a
+    # complete request is booked without relying on another LLM turn.
+    if _complete_booking_context(context):
+        try:
+            post_booking = _deterministic_booking(ctx, context)
+        except Exception as error:
+            log.exception("Post-graph deterministic booking failed: %s", error)
+            post_booking = None
 
-    if post_booking:
-        context = post_booking.get("context", context)
-        conversation.context = context
+        if post_booking:
+            context = post_booking.get("context", context)
+            if post_booking.get("status") == "CONFIRMED":
+                doctor = context.get("doctor_name") or "the doctor"
+                hospital = context.get("hospital_name")
+                reply = (
+                    f"Your appointment with {doctor}"
+                    + (f" at {hospital}" if hospital else "")
+                    + f" on {context.get('date')} at {context.get('time')} is confirmed."
+                )
+                conversation.messages = (conversation.messages or []) + [
+                    {"role": "user", "content": user_text},
+                    {"role": "assistant", "content": reply},
+                ]
+                conversation.context = context
+                db.add(conversation)
+                db.commit()
+                return {
+                    "reply": reply,
+                    "capabilities_used": ["check_availability", "create_appointment"],
+                    "correlation_id": conversation.correlation_id,
+                    "context": context,
+                }
 
-        if post_booking.get("status") == "CONFIRMED":
-            doctor = context.get("doctor_name") or "the doctor"
-            hospital = context.get("hospital_name")
-            reply = (
-                f"Your appointment with {doctor}"
-                + (f" at {hospital}" if hospital else "")
-                + f" on {context.get('date')} at {context.get('time')} is confirmed."
-            )
-            used = list(dict.fromkeys(used + ["check_availability", "create_appointment"]))
-
-        elif post_booking.get("status") == "UNAVAILABLE":
-            formatted = _format_real_alternatives(
-                context,
-                post_booking.get("result") or {},
-            )
-            if formatted:
-                reply = formatted
-            used = list(dict.fromkeys(used + ["check_availability"]))
-
-        elif post_booking.get("status") == "NOT_CONFIRMED":
-            create_result = post_booking.get("result") or {}
-            if isinstance(create_result, dict) and create_result.get("message"):
-                reply = create_result["message"]
-            else:
-                reply = "The requested appointment could not be confirmed."
+            if post_booking.get("status") == "UNAVAILABLE":
+                day_result = post_booking.get("result") or {}
+                reply = _format_real_alternatives(context, day_result)
+                if not reply:
+                    reply = (
+                        f"The requested time is not available on {context.get('date')}; "
+                        "please choose another available time."
+                    )
+                conversation.messages = (conversation.messages or []) + [
+                    {"role": "user", "content": user_text},
+                    {"role": "assistant", "content": reply},
+                ]
+                conversation.context = context
+                db.add(conversation)
+                db.commit()
+                return {
+                    "reply": reply,
+                    "capabilities_used": ["check_availability"],
+                    "correlation_id": conversation.correlation_id,
+                    "context": context,
+                }
 
     # ------------------------------------------------------------
     # Save messages
