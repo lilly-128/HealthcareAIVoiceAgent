@@ -151,10 +151,7 @@ def _city_matches(
     if not requested or not actual:
         return False
 
-    return (
-        requested in actual
-        or actual in requested
-    )
+    return requested == actual
 
 
 # =============================================================
@@ -553,8 +550,17 @@ def search_hospitals(
     ).all()
 
     output = []
+    seen_hospitals = set()
 
     for hospital in hospitals:
+        hospital_key = (
+            str(hospital.id),
+            _normalize_text(hospital.name),
+            _normalize_text(hospital.city),
+        )
+        if hospital_key in seen_hospitals:
+            continue
+        seen_hospitals.add(hospital_key)
 
         if city_value:
 
