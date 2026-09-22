@@ -88,7 +88,7 @@ MAX_TOOL_ROUNDS = 4
 # ================================================================
 
 GROQ_MODEL_CANDIDATES = [
-    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
     "openai/gpt-oss-20b",
     "qwen/qwen3.8-27b",
 ]
@@ -301,6 +301,9 @@ def build_tools(
     tools = []
 
     for name, params in TOOL_SCHEMAS.items():
+
+        if name == "create_appointment":
+            continue
 
         target_fn = REGISTRY[name]
 
@@ -820,6 +823,56 @@ def _extract_time(
 
 
 # ================================================================
+# Extract city from normal patient text
+# ================================================================
+
+def _normalize_city(value: str | None) -> Optional[str]:
+    if not value:
+        return None
+    value = " ".join(value.strip().split())
+    aliases = {
+        "vizag": "Visakhapatnam",
+        "visakhapatnam": "Visakhapatnam",
+        "amalapuram": "Amalapuram",
+    }
+    return aliases.get(value.lower(), value.title())
+
+
+def _extract_city(text: str) -> Optional[str]:
+    pattern = r"\b(?:in|from|near)\s+([A-Za-z][A-Za-z .'-]{1,50}?)(?=\s+(?:for|on|at|around|near|with)\b|[,.!?]|$)"
+    for match in re.finditer(pattern, text, re.IGNORECASE):
+        candidate = re.sub(r"\s+", " ", match.group(1).strip(" ,.!?"))
+        if candidate.lower() in {
+            "a doctor", "doctor", "doctors", "a hospital", "hospital",
+            "the doctor", "the hospital", "morning", "afternoon", "evening",
+        }:
+            continue
+        return _normalize_city(candidate)
+
+    # Also support a standalone city message such as:
+    #     Visakhapatnam
+    # This is deliberately conservative so words like "yes", "doctor",
+    # or "appointment" are never treated as cities.
+    standalone = re.sub(r"\s+", " ", text.strip(" ,.!?"))
+    if (
+        standalone
+        and len(standalone.split()) <= 4
+        and not re.search(r"\d", standalone)
+        and not _extract_specialty(standalone)
+        and standalone.lower() not in {
+            "yes", "no", "okay", "ok", "confirm", "confirmed",
+            "book", "booking", "appointment", "appointments",
+            "doctor", "doctors", "hospital", "hospitals",
+            "morning", "afternoon", "evening", "night",
+        }
+        and not re.match(r"^(?:dr\.?|doctor)\s+", standalone, re.IGNORECASE)
+    ):
+        return _normalize_city(standalone)
+
+    return None
+
+
+# ================================================================
 # Detect simple specialty changes
 # ================================================================
 
@@ -933,6 +986,23 @@ def _extract_user_context(
             updated[
                 "selected_slot_id"
             ] = None
+
+    # ------------------------------------------------------------
+    # City
+    # ------------------------------------------------------------
+
+    city_value = _extract_city(text)
+    if city_value:
+        old_city = updated.get("city")
+        updated["city"] = city_value
+        if old_city and old_city.strip().lower() != city_value.strip().lower():
+            updated["hospital_id"] = None
+            updated["hospital_name"] = None
+            updated["doctor_id"] = None
+            updated["doctor_name"] = None
+            updated["selected_slot_id"] = None
+            updated["appointment_id"] = None
+            updated["booking_confirmed"] = False
 
     # ------------------------------------------------------------
     # Date
@@ -1864,6 +1934,41 @@ def build_graph(
 
 
 # ================================================================
+# GUARANTEED RESPONSE FALLBACK
+# ================================================================
+
+def _guaranteed_reply(context: dict, user_text: str, error: Exception | None = None) -> str:
+    """Return a deterministic, non-empty response if the LLM graph fails."""
+    if context.get("booking_confirmed"):
+        doctor = context.get("doctor_name") or "the doctor"
+        date_value = context.get("date") or "the selected date"
+        time_value = context.get("time") or "the selected time"
+        return f"Your appointment with {doctor} on {date_value} at {time_value} is confirmed."
+
+    if context.get("doctor_id") and context.get("date") and not context.get("time"):
+        doctor = context.get("doctor_name") or "the selected doctor"
+        return f"What time would you like for your appointment with {doctor} on {context['date']}?"
+
+    if context.get("doctor_id") and context.get("time") and not context.get("date"):
+        doctor = context.get("doctor_name") or "the selected doctor"
+        return f"What date would you like for your appointment with {doctor} at {context['time']}?"
+
+    if context.get("doctor_id") and context.get("date") and context.get("time"):
+        return "I could not complete the appointment request. Please try the same request again."
+
+    if context.get("hospital_id") and not context.get("doctor_id"):
+        return "Which doctor would you like to book?"
+
+    if context.get("specialty") and not context.get("city"):
+        return "Which city should I search for the doctor?"
+
+    if context.get("city") and not context.get("specialty"):
+        return "Which medical specialty do you need?"
+
+    return "I could not process that request. Please tell me what you would like to do."
+
+
+# ================================================================
 # RUN ONE PATIENT TURN
 # ================================================================
 
@@ -2014,9 +2119,26 @@ def run_turn(
     # Build graph
     # ------------------------------------------------------------
 
-    graph = build_graph(
-        ctx
-    )
+    try:
+        graph = build_graph(
+            ctx
+        )
+    except Exception as error:
+        log.exception("Failed to build AI graph: %s", error)
+        reply = _guaranteed_reply(context, user_text, error)
+        conversation.messages = (conversation.messages or []) + [
+            {"role": "user", "content": user_text},
+            {"role": "assistant", "content": reply},
+        ]
+        conversation.context = context
+        db.add(conversation)
+        db.commit()
+        return {
+            "reply": reply,
+            "capabilities_used": [],
+            "correlation_id": conversation.correlation_id,
+            "context": context,
+        }
 
     # ------------------------------------------------------------
     # Build LLM history
@@ -2150,8 +2272,9 @@ BOOKING FLOW:
 4. Find doctors belonging to that hospital.
 5. As soon as doctor + date + time are known, AUTOMATICALLY call
    check_availability. Never ask the patient to verify availability.
-6. If the exact requested time is available, AUTOMATICALLY call
-   create_appointment using the returned slot_id.
+6. If the exact requested time is available, the backend will create the
+   appointment using the real slot_id returned by the database. Do not invent
+   or request a slot_id.
 7. A complete request such as "Book Dr. Guna at 11 am on 26-09-2026"
    is already a booking instruction. Do NOT ask an additional
    yes/no confirmation before creating the appointment.
@@ -2228,42 +2351,51 @@ Never call a tool simply because a previous tool was called.
     # bounded tool execution budget.
     # ------------------------------------------------------------
 
-    result = graph.invoke(
-        {
-            "messages": history,
-            "tool_rounds": 0,
-        },
-        {
-            # This is NOT the mechanism preventing the loop.
-            #
-            # The actual protection is MAX_TOOL_ROUNDS above.
-            #
-            # 20 simply gives the bounded graph enough execution
-            # steps to finish normally.
-            "recursion_limit": 20,
-        },
-    )
+    try:
+        result = graph.invoke(
+            {
+                "messages": history,
+                "tool_rounds": 0,
+            },
+            {
+                "recursion_limit": 20,
+            },
+        )
+    except Exception as error:
+        log.exception("AI graph execution failed: %s", error)
+        reply = _guaranteed_reply(context, user_text, error)
+        conversation.messages = (conversation.messages or []) + [
+            {"role": "user", "content": user_text},
+            {"role": "assistant", "content": reply},
+        ]
+        conversation.context = context
+        db.add(conversation)
+        db.commit()
+        return {
+            "reply": reply,
+            "capabilities_used": [],
+            "correlation_id": conversation.correlation_id,
+            "context": context,
+        }
 
     # ------------------------------------------------------------
     # Final response
     # ------------------------------------------------------------
 
-    final = result[
-        "messages"
-    ][-1]
+    messages = result.get("messages", [])
+    final = messages[-1] if messages else None
 
-    if isinstance(
-        final.content,
-        str,
-    ):
-
-        reply = final.content
-
+    if final is not None and isinstance(final.content, str):
+        reply = final.content.strip()
+    elif final is not None:
+        reply = str(final.content).strip()
     else:
+        reply = ""
 
-        reply = str(
-            final.content
-        )
+    # Some tool-calling models can finish with an empty content field.
+    # Never return an empty API response.
+    if not reply:
+        reply = _guaranteed_reply(context, user_text)
 
     # ------------------------------------------------------------
     # Capabilities used
@@ -2307,6 +2439,45 @@ Never call a tool simply because a previous tool was called.
         result,
         user_text,
     )
+
+    # ------------------------------------------------------------
+    # Backend-controlled booking after tool discovery
+    # ------------------------------------------------------------
+    try:
+        post_booking = _deterministic_booking(ctx, context)
+    except Exception as error:
+        post_booking = None
+        log.exception("Post-graph deterministic booking failed: %s", error)
+
+    if post_booking:
+        context = post_booking.get("context", context)
+        conversation.context = context
+
+        if post_booking.get("status") == "CONFIRMED":
+            doctor = context.get("doctor_name") or "the doctor"
+            hospital = context.get("hospital_name")
+            reply = (
+                f"Your appointment with {doctor}"
+                + (f" at {hospital}" if hospital else "")
+                + f" on {context.get('date')} at {context.get('time')} is confirmed."
+            )
+            used = list(dict.fromkeys(used + ["check_availability", "create_appointment"]))
+
+        elif post_booking.get("status") == "UNAVAILABLE":
+            formatted = _format_real_alternatives(
+                context,
+                post_booking.get("result") or {},
+            )
+            if formatted:
+                reply = formatted
+            used = list(dict.fromkeys(used + ["check_availability"]))
+
+        elif post_booking.get("status") == "NOT_CONFIRMED":
+            create_result = post_booking.get("result") or {}
+            if isinstance(create_result, dict) and create_result.get("message"):
+                reply = create_result["message"]
+            else:
+                reply = "The requested appointment could not be confirmed."
 
     # ------------------------------------------------------------
     # Save messages
