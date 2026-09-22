@@ -1518,6 +1518,76 @@ def _save_turn(conversation, db, user_text: str, reply: str, context: dict):
     }
 
 
+
+def _dedupe_records(records: list[dict], key_fields=("hospital_id", "id", "name")) -> list[dict]:
+    """Remove duplicate capability records without changing real IDs."""
+    out = []
+    seen = set()
+    for item in records or []:
+        if not isinstance(item, dict):
+            continue
+        key = None
+        for field in key_fields:
+            value = item.get(field)
+            if value not in (None, ""):
+                key = f"{field}:{str(value).strip().casefold()}"
+                break
+        if key is None:
+            key = f"raw:{json.dumps(item, sort_keys=True, default=str)}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def _stored_hospital_candidates(context: dict) -> list[dict]:
+    return _dedupe_records(
+        context.get("hospital_candidates") or [],
+        key_fields=("hospital_id", "id", "name"),
+    )
+
+
+def _select_hospital_from_message(context: dict, user_text: str) -> bool:
+    """Select a hospital only from previously returned real candidates."""
+    text = user_text.strip().casefold()
+    candidates = _stored_hospital_candidates(context)
+    if not candidates:
+        return False
+
+    matches = []
+    for hospital in candidates:
+        name = str(hospital.get("name") or hospital.get("hospital_name") or "").strip()
+        if name and name.casefold() in text:
+            matches.append(hospital)
+
+    if len(matches) != 1:
+        return False
+
+    hospital = matches[0]
+    hospital_id = hospital.get("hospital_id") or hospital.get("id")
+    if not hospital_id:
+        return False
+
+    context["hospital_id"] = hospital_id
+    context["hospital_name"] = hospital.get("name") or hospital.get("hospital_name")
+    return True
+
+
+def _hospital_id_request(context: dict, user_text: str) -> bool:
+    """Answer an ID request from cached candidates; never call search again."""
+    text = user_text.casefold()
+    return bool(
+        context.get("hospital_candidates")
+        and (
+            "hospital id" in text
+            or "hospital ids" in text
+            or "hospital identifier" in text
+            or ("id" in text and "hospital" in text)
+        )
+    )
+
+
 def _deterministic_discovery(ctx: CapabilityContext, context: dict) -> Optional[dict]:
     """
     Deterministically handle specialty + city discovery.
@@ -1554,6 +1624,7 @@ def _deterministic_discovery(ctx: CapabilityContext, context: dict) -> Optional[
         or hospital_result.get("data")
         or []
     )
+    hospitals = _dedupe_records(hospitals)
 
     # Never trust an LLM-created hospital. Keep only real records that
     # explicitly report the requested city.
@@ -1562,6 +1633,8 @@ def _deterministic_discovery(ctx: CapabilityContext, context: dict) -> Optional[
         h for h in hospitals
         if str(h.get("city") or "").strip().casefold() == requested_city
     ]
+
+    context["hospital_candidates"] = exact_hospitals
 
     if not exact_hospitals:
         return {
@@ -1606,11 +1679,11 @@ def _deterministic_discovery(ctx: CapabilityContext, context: dict) -> Optional[
         or []
     )
 
-    exact_doctors = [
+    exact_doctors = _dedupe_records([
         d for d in doctors
         if str(d.get("city") or "").strip().casefold() == requested_city
         and str(d.get("hospital_id") or "") == str(hospital_id)
-    ]
+    ], key_fields=("doctor_id", "id", "name"))
 
     if not exact_doctors:
         context["hospital_id"] = None
@@ -2121,6 +2194,63 @@ def run_turn(
     )
 
     # ------------------------------------------------------------
+    # Use cached hospital results first.
+    # This prevents repeated search_hospitals calls and lets the
+    # patient select a hospital by name without asking the LLM.
+    # ------------------------------------------------------------
+    if _hospital_id_request(context, user_text):
+        candidates = _stored_hospital_candidates(context)
+        lines = []
+        for h in candidates:
+            hid = h.get("hospital_id") or h.get("id")
+            name = h.get("name") or h.get("hospital_name") or "Hospital"
+            if hid:
+                lines.append(f"{name}: {hid}")
+        reply = "Hospital IDs from the hospitals I found: " + "; ".join(lines) + "."
+        return _save_turn(conversation, db, user_text, reply, context)
+
+    if context.get("specialty") and context.get("city") and not context.get("hospital_id"):
+        if _select_hospital_from_message(context, user_text):
+            # Only search doctors now. Do NOT repeat search_hospitals.
+            search_doctors = REGISTRY.get("search_doctors")
+            if search_doctors:
+                doctor_result = search_doctors(
+                    ctx,
+                    specialty=context["specialty"],
+                    city=context["city"],
+                    hospital_id=context["hospital_id"],
+                ) or {}
+                doctors = _dedupe_records(
+                    doctor_result.get("doctors")
+                    or doctor_result.get("results")
+                    or doctor_result.get("data")
+                    or [],
+                    key_fields=("doctor_id", "id", "name"),
+                )
+                requested_city = str(context["city"]).strip().casefold()
+                doctors = [
+                    d for d in doctors
+                    if str(d.get("city") or "").strip().casefold() == requested_city
+                    and str(d.get("hospital_id") or "") == str(context["hospital_id"])
+                ]
+                if len(doctors) == 1:
+                    context["doctor_id"] = doctors[0].get("doctor_id") or doctors[0].get("id")
+                    context["doctor_name"] = doctors[0].get("doctor_name") or doctors[0].get("name")
+                    reply = (
+                        f"I found {context['doctor_name']} at {context['hospital_name']} "
+                        f"in {context['city']}. What date would you like the appointment?"
+                    )
+                    return _save_turn(conversation, db, user_text, reply, context)
+                if doctors:
+                    names = [d.get("doctor_name") or d.get("name") for d in doctors]
+                    reply = (
+                        f"I found these {context['specialty']} doctors at "
+                        f"{context['hospital_name']} in {context['city']}: "
+                        f"{', '.join(names)}. Which doctor would you like to book?"
+                    )
+                    return _save_turn(conversation, db, user_text, reply, context)
+
+    # ------------------------------------------------------------
     # Deterministic discovery path
     # ------------------------------------------------------------
     try:
@@ -2140,7 +2270,13 @@ def run_turn(
             return {"reply":reply,"capabilities_used":["search_hospitals"],"correlation_id":conversation.correlation_id,"context":context}
         if status == "HOSPITALS_FOUND":
             hospitals=discovery["result"].get("hospitals") or []
-            names=[h.get("name") for h in hospitals if h.get("name")]
+            hospitals = _dedupe_records(hospitals)
+            context["hospital_candidates"] = hospitals
+            names=[]
+            for h in hospitals:
+                name = h.get("name") or h.get("hospital_name")
+                if name and name not in names:
+                    names.append(name)
             reply=f"I found these hospitals in {context['city']} for {context['specialty']}: {', '.join(names)}. Which hospital would you like?"
             conversation.messages=(conversation.messages or []) + [{"role":"user","content":user_text},{"role":"assistant","content":reply}]
             db.add(conversation); db.commit()
