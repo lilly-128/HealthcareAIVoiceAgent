@@ -13,7 +13,7 @@ Rules:
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
 from ..config import settings
@@ -47,25 +47,6 @@ def _now() -> datetime:
 
 def _today() -> date:
     return _now().date()
-
-
-def _to_india_naive(value: datetime) -> datetime:
-    """
-    Convert a datetime to India local time and remove
-    timezone information.
-
-    PostgreSQL scheduling data is stored as naive
-    India-local datetimes.
-    """
-
-    if value.tzinfo is not None:
-        value = value.astimezone(APP_TIMEZONE)
-
-    return value.replace(
-        tzinfo=None,
-        second=0,
-        microsecond=0,
-    )
 
 
 # =============================================================
@@ -149,10 +130,9 @@ def _specialty_matches(
     if not requested or not actual:
         return False
 
-    return (
-        requested in actual
-        or actual in requested
-    )
+    # City matching is exact after normalization. Substring matching can
+    # return doctors from the wrong city.
+    return requested == actual
 
 
 def _city_matches(
@@ -191,6 +171,17 @@ def generate_slots(
     Generate slots from the doctor's active calendar.
 
     Existing slots are NEVER overwritten.
+
+    Example for a 30-minute consultation:
+
+        Calendar: 14:00 - 17:00
+
+        14:00
+        14:30
+        15:00
+        15:30
+        16:00
+        16:30
     """
 
     # =========================================================
@@ -338,6 +329,10 @@ def generate_slots(
             if calendar.end_time is None:
                 continue
 
+            # -------------------------------------------------
+            # Calendar start/end
+            # -------------------------------------------------
+
             cursor = datetime.combine(
                 day,
                 calendar.start_time,
@@ -350,6 +345,10 @@ def generate_slots(
 
             if end <= cursor:
                 continue
+
+            # -------------------------------------------------
+            # Generate each consultation slot
+            # -------------------------------------------------
 
             while cursor + step <= end:
 
@@ -458,9 +457,7 @@ def search_doctors(
     if city_value:
 
         query = query.where(
-            Hospital.city.ilike(
-                f"%{city_value}%"
-            )
+            func.lower(func.trim(Hospital.city)) == city_value
         )
 
     rows = db.execute(
@@ -546,9 +543,7 @@ def search_hospitals(
     if city_value:
 
         query = query.where(
-            Hospital.city.ilike(
-                f"%{city_value}%"
-            )
+            func.lower(func.trim(Hospital.city)) == city_value
         )
 
     hospitals = db.scalars(
@@ -630,8 +625,7 @@ def check_availability(
     """
     Return only REAL AVAILABLE slots from the database.
 
-    All incoming datetimes are normalized to
-    India-local naive datetimes before querying PostgreSQL.
+    No availability is invented.
     """
 
     # =========================================================
@@ -693,16 +687,16 @@ def check_availability(
 
     else:
 
-        # IMPORTANT:
-        # Normalize timezone-aware input from the AI/API.
-        requested_start = _to_india_naive(
-            date_from
+        requested_start = date_from.replace(
+            second=0,
+            microsecond=0,
         )
 
         if date_to is not None:
 
-            requested_end = _to_india_naive(
-                date_to
+            requested_end = date_to.replace(
+                second=0,
+                microsecond=0,
             )
 
         else:
